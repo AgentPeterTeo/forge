@@ -16,7 +16,7 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
-import { createApp } from './app.ts';
+import { createRawApp } from './rawhttp.ts';
 
 // Trimmed and trailing-slash-stripped so even a copy-pasted origin registers cleanly.
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').trim().replace(/\/+$/, '');
@@ -79,7 +79,7 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
-  const server = createApp();
+  const server = createRawApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());

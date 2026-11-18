@@ -111,7 +111,7 @@ export function createApp(): Server {
   return server;
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
   const rawUrl = req.url ?? '/';
   const { path } = splitTarget(rawUrl);
