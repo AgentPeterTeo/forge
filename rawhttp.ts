@@ -142,7 +142,19 @@ export function createRawApp(): net.Server {
       conn.buf = conn.buf.length === used ? Buffer.alloc(0) : conn.buf.subarray(used);
       const isHead = head.method === 'HEAD';
       const collected: Collected = { status: 200, headers: {}, body: Buffer.alloc(0), done: false };
+      const req = {
+        method: head.method,
+        url: head.target,
+        headers: head.headers,
+        on(event: string, cb: (arg?: never) => void): unknown {
+          if (event === 'data') { (cb as (b: Buffer) => void)(body); return req; }
+          if (event === 'end') { cb(); return req; }
+          return req; // 'error' never fires: the body was read whole off the socket
+        },
+        destroy(): void { socket.destroy(); },
+      };
       const res = {
+        req, // ServerResponse carries the request back: the git v2 path reads Git-Protocol off it
         get headersSent(): boolean { return collected.done; },
         writeHead(status: number, headers?: Record<string, string | number>): void {
           collected.status = status;
@@ -158,17 +170,6 @@ export function createRawApp(): net.Server {
         },
         write(): boolean { return true; }, // nothing here streams in pieces; end() carries it all
         flushHeaders(): void { /* end() is the one write */ },
-      };
-      const req = {
-        method: head.method,
-        url: head.target,
-        headers: head.headers,
-        on(event: string, cb: (arg?: never) => void): unknown {
-          if (event === 'data') { (cb as (b: Buffer) => void)(body); return req; }
-          if (event === 'end') { cb(); return req; }
-          return req; // 'error' never fires: the body was read whole off the socket
-        },
-        destroy(): void { socket.destroy(); },
       };
       handle(req as never, res as never)
         .catch((error: unknown) => {
