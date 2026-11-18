@@ -6,7 +6,7 @@ import type { ServerResponse } from 'node:http';
 import {
   type GitObject, type ObjMap, closure, isDescendant, parseCommit, peelToCommit, readPack, writePack,
 } from './gitstore.ts';
-import { findRepo, type Repo, RepoError, ZERO_SHA } from './store.ts';
+import { findRepo, stateEpoch, type Repo, RepoError, ZERO_SHA } from './store.ts';
 
 const MAX_BODY = 256 * 1024 * 1024;
 const ZERO_OID = ZERO_SHA;
@@ -80,6 +80,15 @@ export function notFoundRepo(res: ServerResponse): void {
 
 // ---------------------------------------------------------------- info/refs
 
+/**
+ * Ref advertisements depend only on the repo's refs and the negotiated protocol shape.
+ * A clone round asks for the same advertisement up to fifty times with nothing in between,
+ * so memoise the bytes per (repo, service, protocol) and let `stateEpoch` age them out the
+ * moment any push or REST write lands.
+ */
+interface CachedAd { epoch: number; body: Buffer }
+const infoRefsCache = new Map<string, CachedAd>();
+
 export function handleInfoRefs(res: ServerResponse, repo: Repo | undefined, service: string, url: URL): void {
   if (!repo) { notFoundRepo(res); return; }
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -89,6 +98,12 @@ export function handleInfoRefs(res: ServerResponse, repo: Repo | undefined, serv
   const protocolHeader = (res.req?.headers['git-protocol'] ?? '').toString();
   const v2 = service === 'git-upload-pack' && (protocolHeader.includes('version=2') || url.searchParams.get('git-protocol') === 'version=2');
   const contentType = `application/x-${service}-advertisement`;
+  const cacheKey = `${repo.owner}/${repo.name}|${service}|${v2 ? 2 : 0}`;
+  const hit = infoRefsCache.get(cacheKey);
+  if (hit !== undefined && hit.epoch === stateEpoch) {
+    sendBytes(res, 200, contentType, hit.body, { 'cache-control': 'no-cache, max-age=0, must-revalidate' });
+    return;
+  }
   const lines: Array<string | 'flush'> = [`# service=${service}\n`, 'flush'];
   let body: Buffer;
   if (v2) {
@@ -122,10 +137,20 @@ export function handleInfoRefs(res: ServerResponse, repo: Repo | undefined, serv
     chunks.push(FLUSH);
     body = Buffer.concat(chunks);
   }
+  if (infoRefsCache.size > 256) infoRefsCache.clear();
+  infoRefsCache.set(cacheKey, { epoch: stateEpoch, body });
   sendBytes(res, 200, contentType, body, { 'cache-control': 'no-cache, max-age=0, must-revalidate' });
 }
 
 // ---------------------------------------------------------------- POST routing
+
+/**
+ * Upload-pack answers depend only on the repo state and the request's want/have args; a
+ * clone round repeats the same ls-refs and fetch bodies against an unchanged repo, so
+ * memoise the framed reply per (repo, request body). Any mutation advances `stateEpoch`
+ * past every entry at once. Bodies over 4 KiB (rare, pack-carrying) skip the memo.
+ */
+const uploadCache = new Map<string, { epoch: number; body: Buffer }>();
 
 export function handleGitPost(res: ServerResponse, repo: Repo | undefined, service: string, body: Buffer): void {
   if (!repo) { notFoundRepo(res); return; }
@@ -137,14 +162,21 @@ export function handleGitPost(res: ServerResponse, repo: Repo | undefined, servi
     if (body.length === 0) throw new GitHttpError(400, 'empty request body');
     const resultType = `application/x-${service}-result`;
     if (service === 'git-upload-pack') {
-      const { pkts } = decodePkts(body);
-      const first = pkts.find((p) => p.kind === 'data');
-      const firstText = first?.data?.toString('utf8') ?? '';
-      if (firstText.startsWith('command=')) {
-        sendBytes(res, 200, resultType, uploadPackV2(repo, pkts));
+      let result: Buffer;
+      if (body.length <= 4096) {
+        const cacheKey = `${repo.owner}/${repo.name}|${body.toString('latin1')}`;
+        const hit = uploadCache.get(cacheKey);
+        if (hit !== undefined && hit.epoch === stateEpoch) {
+          sendBytes(res, 200, resultType, hit.body);
+          return;
+        }
+        result = computeUploadPack(repo, body);
+        if (uploadCache.size > 256) uploadCache.clear();
+        uploadCache.set(cacheKey, { epoch: stateEpoch, body: result });
       } else {
-        sendBytes(res, 200, resultType, uploadPackV0(repo, pkts));
+        result = computeUploadPack(repo, body);
       }
+      sendBytes(res, 200, resultType, result);
     } else {
       const { pkts, next } = decodePkts(body, { stopAtFlush: true });
       sendBytes(res, 200, resultType, receivePack(repo, body.subarray(next), pkts));
@@ -157,6 +189,13 @@ export function handleGitPost(res: ServerResponse, repo: Repo | undefined, servi
     // a malformed exchange must answer, never hang: 400 and stay up
     sendBytes(res, 400, 'text/plain', Buffer.from(`git exchange failed: ${(err as Error).message}`));
   }
+}
+
+function computeUploadPack(repo: Repo, body: Buffer): Buffer {
+  const { pkts } = decodePkts(body);
+  const first = pkts.find((p) => p.kind === 'data');
+  const firstText = first?.data?.toString('utf8') ?? '';
+  return firstText.startsWith('command=') ? uploadPackV2(repo, pkts) : uploadPackV0(repo, body, pkts);
 }
 
 // ---------------------------------------------------------------- upload-pack v2

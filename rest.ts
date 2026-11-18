@@ -8,7 +8,7 @@ import {
   addComment, commitToBranch, commitToExistingBranch, createIssue, createLabel, createPull, createRepo,
   deleteRepo, diffTrees, findIssue, findRepo, FIXED_TS, FORGE_USER, insertBlob, type Issue,
   type IssueComment, listIssues, listRepos, mergePull, type PullRequest, refHead, removePath, type Repo,
-  RepoError, repoKey, repos, resolveRef, upsertPath, walkHistory,
+  RepoError, repoKey, repos, resolveRef, stateEpoch, upsertPath, walkHistory,
 } from './store.ts';
 
 export class RestError extends Error {
@@ -29,9 +29,40 @@ export function nextRequestId(): string {
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const payload = Buffer.from(JSON.stringify(body), 'utf8');
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': String(payload.length), 'x-github-request-id': nextRequestId(), ...headers });
-  res.end(payload);
+  const text = JSON.stringify(body);
+  if (currentGetKey !== null && (status === 200 || status === 404)) {
+    if (restGetCache.size > 512) restGetCache.clear();
+    restGetCache.set(currentGetKey, { epoch: stateEpoch, status, text, headers });
+  }
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(text)), 'x-github-request-id': nextRequestId(), ...headers });
+  res.end(text);
+}
+
+// ---------------------------------------------------------------- GET response memo
+// A REST GET's answer depends only on the store state, the request target and the Host the
+// caller used (pagination links). `stateEpoch` advances on every mutation, so any write
+// invalidates all memoised answers at once; nothing stale can ever be served.
+
+interface CachedGet { epoch: number; status: number; text: string; headers: Record<string, string> }
+const restGetCache = new Map<string, CachedGet>();
+/** Set while a GET routes, so sendJson can memoise the answer; null on every other request. */
+let currentGetKey: string | null = null;
+
+/** Cache key: the raw request target (path + query) plus the Host the links must carry. */
+export function getCacheKey(rawUrl: string, host: string): string {
+  return `${rawUrl}|${host}`;
+}
+
+/** A memoised answer that is still current, or null. Mutations advance the epoch past it. */
+export function lookupGet(key: string): CachedGet | null {
+  const hit = restGetCache.get(key);
+  return hit !== undefined && hit.epoch === stateEpoch ? hit : null;
+}
+
+/** Serve a memoised answer verbatim; the request id stays per-request. */
+export function respondCachedGet(res: ServerResponse, hit: CachedGet): void {
+  res.writeHead(hit.status, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(hit.text)), 'x-github-request-id': nextRequestId(), ...hit.headers });
+  res.end(hit.text);
 }
 
 // ---------------------------------------------------------------- shapes
@@ -172,9 +203,14 @@ export interface RestRequest {
   url: URL;
   req: { headers: Record<string, unknown> };
   body: Record<string, unknown> | null;
+  /** The raw request target (path + query) — the cache key half that needs no URL object. */
+  rawUrl: string;
 }
 
 export function handleRest(res: ServerResponse, request: RestRequest): boolean {
+  const key = request.method === 'GET' ? getCacheKey(request.rawUrl, String(request.req.headers.host ?? 'forge.example')) : null;
+  const prev = currentGetKey;
+  currentGetKey = key;
   try {
     return routeRest(res, request);
   } catch (err) {
@@ -184,6 +220,8 @@ export function handleRest(res: ServerResponse, request: RestRequest): boolean {
       return true;
     }
     throw err;
+  } finally {
+    currentGetKey = prev;
   }
 }
 

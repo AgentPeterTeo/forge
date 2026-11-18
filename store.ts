@@ -2,7 +2,17 @@
  * store.ts — the in-memory forge state: repos, issues, pulls, labels, comments.
  * One Map of repos; every surface (REST, GraphQL, MCP, git) shares this state.
  */
-import { buildCommit, buildTag, buildTree, closure, parseCommit, parseTree, storeObject, type GitObject, type ObjMap, type TreeEntry } from './gitstore.ts';
+import { buildCommit, buildTag, buildTree, closure, parseCommit, parseCommitCached, parseTree, storeObject, type GitObject, type ObjMap, type TreeEntry } from './gitstore.ts';
+
+/**
+ * A monotonic counter bumped before every state-mutating request (REST non-GET, GraphQL/MCP
+ * POST, git receive-pack). Read paths memoise their responses against it, so any mutation
+ * invalidates every cached response in O(1) without tracking which repo changed.
+ */
+export let stateEpoch = 0;
+export function bumpEpoch(): void {
+  stateEpoch += 1;
+}
 
 export const FIXED_TS = '2026-01-01T00:00:00Z';
 export const FORGE_USER = { login: 'adaiversen', id: 1000, type: 'User', name: 'ada iversen' } as const;
@@ -324,10 +334,10 @@ export function walkHistory(repo: Repo, start: string, limit = 100): string[] {
     const oid = queue.shift()!;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = repo.objects.get(oid);
-    if (!obj || obj.type !== 'commit') continue;
+    const info = parseCommitCached(repo.objects, oid);
+    if (info === undefined) continue;
     out.push(oid);
-    for (const p of parseCommit(obj.data).parents) queue.push(p);
+    for (const p of info.parents) queue.push(p);
   }
   return out;
 }

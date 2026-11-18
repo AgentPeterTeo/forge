@@ -115,6 +115,46 @@ function parsePerson(s: string): CommitPerson {
   return { name: s.slice(0, lt).trim(), email: s.slice(lt + 1, gt).trim() };
 }
 
+// ------------------------------------------------------------- parsed-object memo
+// Objects in a repo's object map are immutable once stored, and every walk (closure,
+// isDescendant, history, clone) re-parses the same commits and trees over and over.
+// Memoising the parse per object map removes that repeated text split/scan work; the
+// WeakMap key is the map itself, so a deleted repo's memo is collected with it.
+
+const commitInfoMemo = new WeakMap<ObjMap, Map<string, CommitInfo>>();
+export function parseCommitCached(objects: ObjMap, oid: string): CommitInfo | undefined {
+  const obj = objects.get(oid);
+  if (obj === undefined || obj.type !== 'commit') return undefined;
+  let perRepo = commitInfoMemo.get(objects);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, CommitInfo>();
+    commitInfoMemo.set(objects, perRepo);
+  }
+  let info = perRepo.get(oid);
+  if (info === undefined) {
+    info = parseCommit(obj.data);
+    perRepo.set(oid, info);
+  }
+  return info;
+}
+
+const treeMemo = new WeakMap<ObjMap, Map<string, TreeEntry[]>>();
+export function parseTreeCached(objects: ObjMap, oid: string): TreeEntry[] | undefined {
+  const obj = objects.get(oid);
+  if (obj === undefined || obj.type !== 'tree') return undefined;
+  let perRepo = treeMemo.get(objects);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, TreeEntry[]>();
+    treeMemo.set(objects, perRepo);
+  }
+  let entries = perRepo.get(oid);
+  if (entries === undefined) {
+    entries = parseTree(obj.data);
+    perRepo.set(oid, entries);
+  }
+  return entries;
+}
+
 export interface TagInfo { object: string; type: ObjType; tag: string; message: string }
 
 export function buildTag(info: TagInfo): Buffer {
@@ -349,7 +389,7 @@ export function closure(objects: ObjMap, roots: string[], opts: ClosureOpts = {}
     seen.add(oid);
     if (!exclude || !exclude.has(oid)) result.set(oid, obj);
     if (obj.type === 'commit') {
-      const info = parseCommit(obj.data);
+      const info = parseCommitCached(objects, oid)!;
       if (info.tree) queue.push({ oid: info.tree, generation: Infinity });
       if (stopAt !== undefined && stopAt.has(oid)) {
         if (info.parents.length > 0) shallow.add(oid);
@@ -364,7 +404,7 @@ export function closure(objects: ObjMap, roots: string[], opts: ClosureOpts = {}
     }
     // blobs need no traversal; trees queue their children only through commits' trees below
     if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) {
+      for (const entry of parseTreeCached(objects, oid)!) {
         queue.push({ oid: entry.sha, generation: Infinity });
       }
     }
@@ -382,9 +422,9 @@ export function isDescendant(objects: ObjMap, descendant: string, ancestor: stri
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (oid === ancestor) return true;
-    const obj = objects.get(oid);
-    if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) queue.push(p);
+    const info = parseCommitCached(objects, oid);
+    if (info === undefined) continue;
+    for (const p of info.parents) queue.push(p);
   }
   return false;
 }
