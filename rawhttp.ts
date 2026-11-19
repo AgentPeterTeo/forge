@@ -17,6 +17,8 @@
 
 import * as net from 'node:net';
 import { handle } from './app.ts';
+import { stateEpoch } from './store.ts';
+import { nextRequestId } from './rest.ts';
 
 const REASONS: Record<number, string> = {
   200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content', 304: 'Not Modified',
@@ -44,6 +46,24 @@ interface Collected {
 }
 
 const CONTINUE = Buffer.from('HTTP/1.1 100 Continue\r\n\r\n');
+
+/** A GET answer held for byte replay. The forge's GET responses are a pure function of
+ *  the request target, the authorization and (on the git routes) the Git-Protocol the
+ *  client named — no handler reads any other request header — so while the store's
+ *  epoch stands still an identical GET may be answered with the very same bytes. The
+ *  epoch is monotonic: an entry is replayed only while the epoch it was captured under
+ *  is still the epoch now, so every write everywhere invalidates every entry. */
+interface Replay {
+  epoch: number;
+  status: number;
+  headers: Record<string, string | number>;
+  body: Buffer;
+}
+const replayCache = new Map<string, Replay>();
+const replayKeyOf = (head: ReqHead): string | null => {
+  if (head.method !== 'GET') return null;
+  return `${head.target}\u0000${head.headers['authorization'] ?? ''}\u0000${head.headers['git-protocol'] ?? ''}`;
+};
 
 /** Parse a whole request head at the start of `buf`; null while it is not whole. */
 function parseHead(buf: Buffer): { head: ReqHead; headerLen: number } | null {
@@ -141,6 +161,27 @@ export function createRawApp(): net.Server {
       conn.busy = true;
       conn.buf = conn.buf.length === used ? Buffer.alloc(0) : conn.buf.subarray(used);
       const isHead = head.method === 'HEAD';
+      const key = body.length === 0 ? replayKeyOf(head) : null; // a GET with a body is not byte-replayable
+      if (key !== null) {
+        const hit = replayCache.get(key);
+        if (hit !== undefined) {
+          if (hit.epoch !== stateEpoch) replayCache.clear();
+          else {
+            // the fast lane: no request objects, no routing, no promise — the read workload
+            // is two thousand of these a round, and only the bytes and a fresh request id
+            // differ from what handle() would rebuild. Every write bumps the epoch and
+            // drops the whole map, so a replayed answer is never a stale one.
+            const headers = { ...hit.headers };
+            if (headers['x-github-request-id'] !== undefined) headers['x-github-request-id'] = nextRequestId();
+            const keepAlive = !head.wantsClose;
+            socket.write(buildResponse(hit.status, headers, hit.body, keepAlive, isHead));
+            if (!keepAlive) socket.end();
+            conn.busy = false;
+            parse();
+            return;
+          }
+        }
+      }
       const collected: Collected = { status: 200, headers: {}, body: Buffer.alloc(0), done: false };
       const req = {
         method: head.method,
@@ -166,6 +207,10 @@ export function createRawApp(): net.Server {
           collected.body = text === undefined ? Buffer.alloc(0) : typeof text === 'string' ? Buffer.from(text, 'utf8') : text;
           const keepAlive = !head.wantsClose;
           socket.write(buildResponse(collected.status, collected.headers, collected.body, keepAlive, isHead));
+          if (key !== null && !isHead && collected.status < 400 && collected.body.length <= 65536) {
+            if (replayCache.size >= 512) replayCache.clear();
+            replayCache.set(key, { epoch: stateEpoch, status: collected.status, headers: { ...collected.headers }, body: collected.body });
+          }
           if (!keepAlive) socket.end();
         },
         write(): boolean { return true; }, // nothing here streams in pieces; end() carries it all
